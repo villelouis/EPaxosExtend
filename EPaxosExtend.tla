@@ -2,6 +2,9 @@
 
 EXTENDS Naturals, FiniteSets
 
+InitReplicas == {"r1","r2","r3"}
+PossibleReplicas == {"r1","r2","r3","r4"}
+Replicas == PossibleReplicas
 -----------------------------------------------------------------------------
 
 Max(S) == IF S = {} THEN 0 ELSE CHOOSE i \in S : \A j \in S : j <= i
@@ -15,27 +18,36 @@ Max(S) == IF S = {} THEN 0 ELSE CHOOSE i \in S : \A j \in S : j <= i
 (*       SlowQuorums(r): the set of all slow quorums where r is a command leader *)
 (*********************************************************************************)
 
-CONSTANTS Commands, Replicas, FastQuorums(_), SlowQuorums(_), MaxBallot
+CONSTANTS Commands, MaxBallot
 
-ASSUME IsFiniteSet(Replicas)
+VARIABLES cmdLog, proposed, executed, sentMsg, crtInst, leaderOfInst,
+          committed, ballots, preparing, replicas, locations, cluster
 
-(***************************************************************************)
-(* Quorum conditions:                                                      *)
-(*  (simplified)                                                           *)
-(***************************************************************************)
 
-ASSUME \A r \in Replicas:
-  /\ SlowQuorums(r) \subseteq SUBSET Replicas
-  /\ \A SQ \in SlowQuorums(r):
-    /\ r \in SQ
-    /\ Cardinality(SQ) = (Cardinality(Replicas) \div 2) + 1
+RECURSIVE Allocate(_, _, _)
+Allocate(lcs, L, R) == IF lcs = {} THEN L
+                                 ELSE LET p == CHOOSE p \in lcs: TRUE IN
+                                      LET r == CHOOSE r \in R: TRUE IN
+                                      Allocate(lcs\{p},[L EXCEPT ![r] = p],R\{r})
 
-ASSUME \A r \in Replicas:
-  /\ FastQuorums(r) \subseteq SUBSET Replicas
-  /\ \A FQ \in FastQuorums(r):
-    /\ r \in FQ
-    /\ Cardinality(FQ) = (Cardinality(Replicas) \div 2) +
-                         ((Cardinality(Replicas) \div 2) + 1) \div 2
+Dif(a,b) == IF a > b THEN a - b
+            ELSE b - a
+
+RECURSIVE NearestQuorum(_, _, _, _)
+NearestQuorum(r,Q,R,size) ==
+    IF Cardinality(Q) = (size - 1) THEN (Q \cup {r})
+       ELSE LET L == locations IN
+                LET r1 == CHOOSE r1 \in R: r1 # r /\ (~\E r2 \in R: Dif(L[r],L[r1]) > Dif(L[r],L[r2]) /\ r2 # r )
+                IN NearestQuorum(r, Q \cup {r1}, R \ {r1}, size)
+
+ConstituteQuorum(r,size) ==
+    LET rps == cluster[r] IN NearestQuorum(r,{},rps,size)
+
+FastQSize(r) == (Cardinality(cluster[r]) \div 2) + ((Cardinality(cluster[r]) \div 2) + 1) \div 2
+SlowQSize(r) == (Cardinality(cluster[r]) \div 2) + 1
+
+FastQuorums(r) == {ConstituteQuorum(r, FastQSize(r))}
+SlowQuorums(r) == {ConstituteQuorum(r, SlowQSize(r))}
 
 
 (***************************************************************************)
@@ -113,10 +125,6 @@ Message ==
 (*                                                                             *)
 (*******************************************************************************)
 
-
-VARIABLES cmdLog, proposed, executed, sentMsg, crtInst, leaderOfInst,
-          committed, ballots, preparing
-
 TypeOK ==
     /\ cmdLog \in [Replicas -> SUBSET [inst: Instances,
                                        status: Status,
@@ -136,13 +144,19 @@ TypeOK ==
     /\ preparing \in [Replicas -> SUBSET Instances]
 
 vars == << cmdLog, proposed, executed, sentMsg, crtInst, leaderOfInst,
-           committed, ballots, preparing >>
+           committed, ballots, preparing, replicas, locations, cluster >>
 
 (***************************************************************************)
 (* Initial state predicate                                                 *)
 (***************************************************************************)
 
+InitLocations == Allocate(1..Cardinality(InitReplicas), [r \in InitReplicas |-> 0], InitReplicas)
+InitCluster == [r \in InitReplicas |-> InitReplicas]
+
 Init ==
+  /\ replicas = InitReplicas
+  /\ locations = InitLocations
+  /\ cluster = InitCluster
   /\ sentMsg = {}
   /\ cmdLog = [r \in Replicas |-> {}]
   /\ proposed = {}
@@ -188,7 +202,7 @@ Propose(C, cleader) ==
         /\ (\E Q \in FastQuorums(cleader):
                  StartPhase1(C, cleader, Q, newInst, newBallot, {}))
         /\ crtInst' = [crtInst EXCEPT ![cleader] = @ + 1]
-        /\ UNCHANGED << executed, committed, ballots, preparing >>
+        /\ UNCHANGED << executed, committed, ballots, preparing, replicas, locations, cluster >>
 
 
 Phase1Reply(replica) ==
@@ -221,7 +235,7 @@ Phase1Reply(replica) ==
                                       seq   |-> newSeq,
                                       committed|-> instCom]}
                 /\ UNCHANGED << proposed, crtInst, executed, leaderOfInst,
-                                committed, ballots, preparing >>
+                                committed, ballots, preparing, replicas, locations, cluster >>
 
 Phase1Fast(cleader, i, Q) ==
     /\ i \in leaderOfInst[cleader]
@@ -264,7 +278,7 @@ Phase1Fast(cleader, i, Q) ==
                 /\ leaderOfInst' = [leaderOfInst EXCEPT ![cleader] = @ \ {i}]
                 /\ committed' = [committed EXCEPT ![i] =
                                             @ \cup {<<record.cmd, r.deps, r.seq>>}]
-                /\ UNCHANGED << proposed, executed, crtInst, ballots, preparing >>
+                /\ UNCHANGED << proposed, executed, crtInst, ballots, preparing, replicas, locations, cluster >>
 
 Phase1Slow(cleader, i, Q) ==
     /\ i \in leaderOfInst[cleader]
@@ -299,7 +313,7 @@ Phase1Slow(cleader, i, Q) ==
                             deps : {finalDeps},
                             seq : {finalSeq}])
                 /\ UNCHANGED << proposed, executed, crtInst, leaderOfInst,
-                                committed, ballots, preparing >>
+                                committed, ballots, preparing, replicas, locations, cluster >>
 
 Phase2Reply(replica) ==
     \E msg \in sentMsg:
@@ -322,7 +336,7 @@ Phase2Reply(replica) ==
                                   inst  |-> msg.inst,
                                   ballot|-> msg.ballot]}
             /\ UNCHANGED << proposed, crtInst, executed, leaderOfInst,
-                            committed, ballots, preparing >>
+                            committed, ballots, preparing, replicas, locations, cluster >>
 
 
 Phase2Finalize(cleader, i, Q) ==
@@ -356,7 +370,7 @@ Phase2Finalize(cleader, i, Q) ==
             /\ committed' = [committed EXCEPT ![i] = @ \cup
                                {<<record.cmd, record.deps, record.seq>>}]
             /\ leaderOfInst' = [leaderOfInst EXCEPT ![cleader] = @ \ {i}]
-            /\ UNCHANGED << proposed, executed, crtInst, ballots, preparing >>
+            /\ UNCHANGED << proposed, executed, crtInst, ballots, preparing, replicas, locations, cluster >>
 
 Commit(replica, cmsg) ==
     LET oldRec == {rec \in cmdLog[replica] : rec.inst = cmsg.inst} IN
@@ -372,7 +386,7 @@ Commit(replica, cmsg) ==
         /\ committed' = [committed EXCEPT ![cmsg.inst] = @ \cup
                                {<<cmsg.cmd, cmsg.deps, cmsg.seq>>}]
         /\ UNCHANGED << proposed, executed, crtInst, leaderOfInst,
-                        sentMsg, ballots, preparing >>
+                        sentMsg, ballots, preparing, replicas, locations, cluster >>
 
 
 (***************************************************************************)
@@ -395,7 +409,7 @@ SendPrepare(replica, i, Q) ==
     /\ ballots' = ballots + 1
     /\ preparing' = [preparing EXCEPT ![replica] = @ \cup {i}]
     /\ UNCHANGED << cmdLog, proposed, executed, crtInst,
-                    leaderOfInst, committed >>
+                    leaderOfInst, committed, replicas, locations, cluster >>
 
 ReplyPrepare(replica) ==
     \E msg \in sentMsg :
@@ -426,9 +440,9 @@ ReplyPrepare(replica) ==
                         /\ leaderOfInst' = [leaderOfInst EXCEPT ![replica] =
                                                                 @ \ {rec.inst}]
                         /\ UNCHANGED << proposed, executed, committed,
-                                        crtInst, ballots, preparing >>
+                                        crtInst, ballots, preparing, replicas, locations, cluster >>
                     ELSE UNCHANGED << proposed, executed, committed, crtInst,
-                                      ballots, preparing, leaderOfInst >>
+                                      ballots, preparing, leaderOfInst, replicas, locations, cluster >>
 
            \/ /\ ~(\E rec \in cmdLog[replica] : rec.inst = msg.inst)
               /\ sentMsg' = (sentMsg \ {msg}) \cup
@@ -450,7 +464,7 @@ ReplyPrepare(replica) ==
                               deps  |-> {},
                               seq   |-> 0]}]
               /\ UNCHANGED << proposed, executed, committed, crtInst, ballots,
-                              leaderOfInst, preparing >>
+                              leaderOfInst, preparing, replicas, locations, cluster >>
 
 PrepareFinalize(replica, i, Q) ==
     \* i - instance
@@ -487,7 +501,7 @@ PrepareFinalize(replica, i, Q) ==
                         /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
                         /\ sentMsg' = sentMsg \ replies
                         /\ UNCHANGED << cmdLog, proposed, executed, crtInst, leaderOfInst,
-                                        committed, ballots >>
+                                        committed, ballots, replicas, locations, cluster >>
                 \/ /\ ~(\E msg \in replies : msg.status \in {"committed", "executed"})
                    /\ \E acc \in replies :
                         /\ acc.status = "accepted"
@@ -512,7 +526,7 @@ PrepareFinalize(replica, i, Q) ==
                                   seq   |-> acc.seq]}]
                          /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
                          /\ leaderOfInst' = [leaderOfInst EXCEPT ![replica] = @ \cup {i}]
-                         /\ UNCHANGED << proposed, executed, crtInst, committed, ballots >>
+                         /\ UNCHANGED << proposed, executed, crtInst, committed, ballots, replicas, locations, cluster >>
                 \/ /\ ~(\E msg \in replies :
                         msg.status \in {"accepted", "committed", "executed"})
                         \* true
@@ -544,7 +558,7 @@ PrepareFinalize(replica, i, Q) ==
                                           seq   |-> pac.seq]}]
                                  /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
                                  /\ leaderOfInst' = [leaderOfInst EXCEPT ![replica] = @ \cup {i}]
-                                 /\ UNCHANGED << proposed, executed, crtInst, committed, ballots >>
+                                 /\ UNCHANGED << proposed, executed, crtInst, committed, ballots, replicas, locations, cluster >>
                         \/  /\ \A p1, p2 \in preaccepts : p1.cmd = p2.cmd /\
                                                           p1.deps = p2.deps /\
                                                           p1.seq = p2.seq
@@ -565,7 +579,7 @@ PrepareFinalize(replica, i, Q) ==
                                 /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
                                 /\ leaderOfInst' = [leaderOfInst EXCEPT ![replica] = @ \cup {i}]
                                 /\ UNCHANGED << cmdLog, proposed, executed,
-                                                crtInst, committed, ballots >>
+                                                crtInst, committed, ballots, replicas, locations, cluster >>
                         \/  /\ \/ \E p1, p2 \in preaccepts : p1.cmd # p2.cmd \/
                                                              p1.deps # p2.deps \/
                                                              p1.seq # p2.seq
@@ -578,11 +592,11 @@ PrepareFinalize(replica, i, Q) ==
                             /\ LET pac == CHOOSE pac \in preaccepts : pac.cmd # none IN
                                 /\ StartPhase1(pac.cmd, replica, Q, i, rec.ballot, replies)
                                 /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
-                                /\ UNCHANGED << proposed, executed, crtInst, committed, ballots >>)
+                                /\ UNCHANGED << proposed, executed, crtInst, committed, ballots, replicas, locations, cluster >>)
                 \/  /\ \A msg \in replies : msg.status = "not-seen"
                     /\ StartPhase1(none, replica, Q, i, rec.ballot, replies)
                     /\ preparing' = [preparing EXCEPT ![replica] = @ \ {i}]
-                    /\ UNCHANGED << proposed, executed, crtInst, committed, ballots >>
+                    /\ UNCHANGED << proposed, executed, crtInst, committed, ballots, replicas, locations, cluster >>
 
 ReplyTryPreaccept(replica) ==
     \E tpa \in sentMsg :
@@ -603,7 +617,7 @@ ReplyTryPreaccept(replica) ==
                                       ballot|-> tpa.ballot,
                                       status|-> rec.status]})
                         /\ UNCHANGED << cmdLog, proposed, executed, committed, crtInst,
-                                        ballots, leaderOfInst, preparing >>
+                                        ballots, leaderOfInst, preparing, replicas, locations, cluster >>
                \/ /\ (\A rec \in cmdLog[replica] \ oldRec:
                             tpa.inst \in rec.deps \/ (rec.inst \in tpa.deps /\
                                                       rec.seq < tpa.seq))
@@ -622,7 +636,7 @@ ReplyTryPreaccept(replica) ==
                                       deps  |-> tpa.deps,
                                       seq   |-> tpa.seq]}]
                   /\ UNCHANGED << proposed, executed, committed, crtInst, ballots,
-                                  leaderOfInst, preparing >>
+                                  leaderOfInst, preparing, replicas, locations, cluster >>
 
 
 FinalizeTryPreAccept(cleader, i, Q) ==
@@ -650,17 +664,17 @@ FinalizeTryPreAccept(cleader, i, Q) ==
                               deps  |-> rec.deps,
                               seq   |-> rec.seq]}]
                   /\ UNCHANGED << proposed, executed, committed, crtInst, ballots,
-                                  leaderOfInst, preparing >>
+                                  leaderOfInst, preparing, replicas, locations, cluster >>
                \/ /\ \E tpr \in tprs: tpr.status \in {"accepted", "committed", "executed"}
                   /\ StartPhase1(rec.cmd, cleader, Q, i, rec.ballot, tprs)
                   /\ UNCHANGED << proposed, executed, committed, crtInst, ballots,
-                                  leaderOfInst, preparing >>
+                                  leaderOfInst, preparing, replicas, locations, cluster >>
                \/ /\ \E tpr \in tprs: tpr.status = "pre-accepted"
                   /\ \A tpr \in tprs: tpr.status \in {"OK", "pre-accepted"}
                   /\ sentMsg' = sentMsg \ tprs
                   /\ leaderOfInst' = [leaderOfInst EXCEPT ![cleader] = @ \ {i}]
                   /\ UNCHANGED << cmdLog, proposed, executed, committed, crtInst,
-                                  ballots, preparing >>
+                                  ballots, preparing, replicas, locations, cluster >>
 
 
 
@@ -670,15 +684,15 @@ FinalizeTryPreAccept(cleader, i, Q) ==
 
 CommandLeaderAction ==
     \/ (\E C \in (Commands \ proposed) :
-            \E cleader \in Replicas : Propose(C, cleader))
-    \/ (\E cleader \in Replicas : \E inst \in leaderOfInst[cleader] :
+            \E cleader \in replicas : Propose(C, cleader))
+    \/ (\E cleader \in replicas : \E inst \in leaderOfInst[cleader] :
             \/ (\E Q \in FastQuorums(cleader) : Phase1Fast(cleader, inst, Q))
             \/ (\E Q \in SlowQuorums(cleader) : Phase1Slow(cleader, inst, Q))
             \/ (\E Q \in SlowQuorums(cleader) : Phase2Finalize(cleader, inst, Q))
             \/ (\E Q \in SlowQuorums(cleader) : FinalizeTryPreAccept(cleader, inst, Q)))
 
 ReplicaAction ==
-    \E replica \in Replicas :
+    \E replica \in replicas :
         (\/ Phase1Reply(replica)
          \/ Phase2Reply(replica)
          \/ \E cmsg \in sentMsg : (cmsg.type = "commit" /\ Commit(replica, cmsg))
@@ -742,6 +756,6 @@ THEOREM Spec => ([]TypeOK) /\ Nontriviality /\ Stability /\ Consistency
 
 =============================================================================
 \* Modification History
-\* Last modified Wed Jun 17 23:03:17 MSK 2020 by a17883227
+\* Last modified Tue Jun 23 13:55:00 MSK 2020 by a17883227
 \* Last modified Sat Aug 24 12:25:28 EDT 2013 by iulian
 \* Created Tue Apr 30 11:49:57 EDT 2013 by iulian
